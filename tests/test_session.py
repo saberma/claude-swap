@@ -29,6 +29,9 @@ from claude_swap.paths import get_global_config_path
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
+    MCP_PROJECTS_DISPLACED_STASH,
+    MCP_PROJECTS_MANIFEST,
+    PROJECT_ENTRY_DEFAULTS,
     SHARE_MANIFEST,
     SessionManager,
     _probe_env,
@@ -961,7 +964,9 @@ def mcp_setup(temp_home: Path, seeded_switcher):
             {
                 "oauthAccount": {"emailAddress": "default@example.com"},
                 "mcpServers": {"github": GITHUB_MCP},
-                "projects": {"/repo": {"mcpServers": {"proj-local": {}}}},
+                # 不带 mcpServers 的 project 条目：其他字段不跟着镜像。
+                # local scope 镜像见 TestProjectMcpMirror。
+                "projects": {"/repo": {"allowedTools": ["Bash"]}},
             }
         )
     )
@@ -1262,6 +1267,326 @@ class TestMcpMirror:
 
         mgr._sync_sharing(session_dir, share=True)
         assert _session_config(session_dir)["mcpServers"] == {"github": GITHUB_MCP}
+
+
+# ---------------------------------------------------------------------------
+# local scope mcpServers 镜像（projects[<path>].mcpServers）
+# ---------------------------------------------------------------------------
+
+ADS_MCP = {"type": "stdio", "command": "ads-mcp", "env": {"API_KEY": "fake"}}
+GA_MCP = {"type": "http", "url": "https://ga.example", "headers": {"X": "fake"}}
+
+
+@pytest.fixture
+def project_mcp_setup(temp_home: Path, seeded_switcher):
+    """默认侧 /w、/repo 各有 local MCP；session 有 /w（无 MCP）和独有的 /mine。"""
+    default_config = temp_home / ".claude.json"
+    default_config.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "/w": {"allowedTools": ["Bash"], "mcpServers": {"ads": ADS_MCP}},
+                    "/repo": {"mcpServers": {"ga": GA_MCP}},
+                    "/no-mcp": {"allowedTools": [], "mcpServers": {}},
+                },
+            }
+        )
+    )
+    session_dir = session_dir_for(
+        seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+    )
+    session_dir.mkdir(parents=True)
+    (session_dir / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {"emailAddress": ACCOUNT_EMAIL},
+                "projects": {
+                    "/w": {"allowedTools": [], "hasTrustDialogAccepted": True},
+                    "/mine": {"mcpServers": {"own": LOCAL_MCP}},
+                    "/no-mcp": {"mcpServers": {"own": LOCAL_MCP}},
+                },
+            }
+        )
+    )
+    return default_config, session_dir, SessionManager(seeded_switcher)
+
+
+def _session_projects(session_dir: Path) -> dict:
+    return _session_config(session_dir)["projects"]
+
+
+def _edit_json(path: Path, mutate) -> None:
+    data = json.loads(path.read_text())
+    mutate(data)
+    path.write_text(json.dumps(data))
+
+
+def _manifest_paths(session_dir: Path) -> list[str]:
+    return json.loads((session_dir / MCP_PROJECTS_MANIFEST).read_text())["paths"]
+
+
+class TestProjectMcpMirror:
+    def test_mirrors_into_existing_and_new_entries(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_projects(session_dir)
+        # 已有条目只换 mcpServers，其他字段（含 session 自己的信任状态）保留。
+        assert projects["/w"] == {
+            "allowedTools": [],
+            "hasTrustDialogAccepted": True,
+            "mcpServers": {"ads": ADS_MCP},
+        }
+        # 缺失条目按 Claude Code 默认形状新建。
+        assert projects["/repo"] == {
+            **PROJECT_ENTRY_DEFAULTS,
+            "mcpServers": {"ga": GA_MCP},
+        }
+        assert _manifest_paths(session_dir) == ["/repo", "/w"]
+        assert not (session_dir / MCP_PROJECTS_DISPLACED_STASH).exists()
+
+    def test_session_only_paths_untouched(self, project_mcp_setup):
+        """默认侧没有该 path，或该 path 没有 MCP：session 自己的定义不动。"""
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_projects(session_dir)
+        assert projects["/mine"] == {"mcpServers": {"own": LOCAL_MCP}}
+        assert projects["/no-mcp"] == {"mcpServers": {"own": LOCAL_MCP}}
+
+    def test_session_change_overwritten_without_stash(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)  # 接管
+
+        _edit_json(
+            session_dir / ".claude.json",
+            lambda c: c["projects"]["/w"]["mcpServers"].update(mine=LOCAL_MCP),
+        )
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_projects(session_dir)["/w"]["mcpServers"] == {"ads": ADS_MCP}
+        assert not (session_dir / MCP_PROJECTS_DISPLACED_STASH).exists()
+
+    def test_default_edits_propagate(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        edited = {"ads": {**ADS_MCP, "env": {"API_KEY": "rotated"}}, "new": {}}
+        _edit_json(
+            default_config,
+            lambda c: c["projects"]["/w"].__setitem__("mcpServers", edited),
+        )
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_projects(session_dir)["/w"]["mcpServers"] == edited
+
+    @pytest.mark.parametrize("how", ["empty", "key_removed", "entry_removed"])
+    def test_default_removal_clears_mirrored_path(self, project_mcp_setup, how):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        def mutate(c):
+            if how == "empty":
+                c["projects"]["/w"]["mcpServers"] = {}
+            elif how == "key_removed":
+                del c["projects"]["/w"]["mcpServers"]
+            else:
+                del c["projects"]["/w"]
+
+        _edit_json(default_config, mutate)
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_projects(session_dir)
+        assert projects["/w"] == {
+            "allowedTools": [],
+            "hasTrustDialogAccepted": True,
+            "mcpServers": {},
+        }
+        assert projects["/repo"]["mcpServers"] == {"ga": GA_MCP}
+        assert projects["/mine"] == {"mcpServers": {"own": LOCAL_MCP}}
+        assert _manifest_paths(session_dir) == ["/repo"]
+
+    def test_first_adoption_stashes_displaced_only(self, project_mcp_setup, capsys):
+        default_config, session_dir, mgr = project_mcp_setup
+        _edit_json(
+            session_dir / ".claude.json",
+            lambda c: c["projects"]["/w"].__setitem__(
+                "mcpServers", {"pre": LOCAL_MCP, "ads": ADS_MCP}
+            ),
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert _session_projects(session_dir)["/w"]["mcpServers"] == {"ads": ADS_MCP}
+        stash = json.loads((session_dir / MCP_PROJECTS_DISPLACED_STASH).read_text())
+        assert stash == {
+            "schemaVersion": 1,
+            "projects": {"/w": {"mcpServers": {"pre": LOCAL_MCP}}},
+        }
+        assert "saved to" in capsys.readouterr().out
+
+    def test_stash_is_write_once_per_path(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        stash_path = session_dir / MCP_PROJECTS_DISPLACED_STASH
+        original = {"/w": {"mcpServers": {"real-pre": {}}}}
+        stash_path.write_text(json.dumps({"schemaVersion": 1, "projects": original}))
+
+        def mutate(c):
+            c["projects"]["/w"]["mcpServers"] = {"drift": {}}
+            c["projects"]["/repo"] = {"mcpServers": {"old": LOCAL_MCP}}
+
+        _edit_json(session_dir / ".claude.json", mutate)
+        mgr._sync_sharing(session_dir, share=True)
+
+        stash = json.loads(stash_path.read_text())
+        assert stash["projects"] == {
+            **original,
+            "/repo": {"mcpServers": {"old": LOCAL_MCP}},
+        }
+        assert _session_projects(session_dir)["/w"]["mcpServers"] == {"ads": ADS_MCP}
+
+    def test_invalid_stash_blocks_reset(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        (session_dir / MCP_PROJECTS_DISPLACED_STASH).mkdir()
+        _edit_json(
+            session_dir / ".claude.json",
+            lambda c: c["projects"]["/w"].__setitem__("mcpServers", {"pre": {}}),
+        )
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+        assert not (session_dir / MCP_PROJECTS_MANIFEST).exists()
+
+    def test_adopted_in_sync_run_takes_no_lock(self, project_mcp_setup, monkeypatch):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        def boom(*args, **kwargs):
+            raise AssertionError("lock taken on the adopted in-sync path")
+
+        monkeypatch.setattr(session_mod, "proper_lockfile", boom)
+        mgr._sync_sharing(session_dir, share=True)  # 不得取锁
+
+    def test_no_share_removes_only_mirrored_then_restores(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        mgr._sync_sharing(session_dir, share=False)
+        projects = _session_projects(session_dir)
+        assert projects["/w"]["mcpServers"] == {}
+        assert projects["/w"]["hasTrustDialogAccepted"] is True
+        assert projects["/repo"]["mcpServers"] == {}
+        assert projects["/mine"] == {"mcpServers": {"own": LOCAL_MCP}}
+        assert projects["/no-mcp"] == {"mcpServers": {"own": LOCAL_MCP}}
+        assert _manifest_paths(session_dir) == []
+
+        mgr._sync_sharing(session_dir, share=True)
+        projects = _session_projects(session_dir)
+        assert projects["/w"]["mcpServers"] == {"ads": ADS_MCP}
+        assert projects["/repo"]["mcpServers"] == {"ga": GA_MCP}
+        assert not (session_dir / MCP_PROJECTS_DISPLACED_STASH).exists()
+
+    def test_no_share_before_adoption_untouched(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_sharing(session_dir, share=False)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+        assert not (session_dir / MCP_PROJECTS_MANIFEST).exists()
+
+    def test_default_without_projects_before_adoption(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        default_config.write_text(json.dumps({"mcpServers": {}}))
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+        assert not (session_dir / MCP_PROJECTS_MANIFEST).exists()
+
+    def test_default_without_projects_after_adoption(self, project_mcp_setup):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+        default_config.write_text(json.dumps({}))
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        projects = _session_projects(session_dir)
+        assert projects["/w"]["mcpServers"] == {}
+        assert projects["/repo"]["mcpServers"] == {}
+        assert projects["/mine"] == {"mcpServers": {"own": LOCAL_MCP}}
+        assert _manifest_paths(session_dir) == []
+
+    @pytest.mark.parametrize("bad", ["projects_list", "entry_string", "servers_list"])
+    def test_malformed_source_leaves_profile_alone(self, project_mcp_setup, bad):
+        default_config, session_dir, mgr = project_mcp_setup
+        mgr._sync_sharing(session_dir, share=True)
+        before = (session_dir / ".claude.json").read_bytes()
+
+        def mutate(c):
+            if bad == "projects_list":
+                c["projects"] = ["bad"]
+            elif bad == "entry_string":
+                c["projects"]["/w"] = "bad"
+            else:
+                c["projects"]["/w"]["mcpServers"] = ["bad"]
+
+        _edit_json(default_config, mutate)
+        mgr._sync_sharing(session_dir, share=True)
+
+        # 看不清的 path 不清空、登记保留；整体格式错时整趟不动。
+        assert (session_dir / ".claude.json").read_bytes() == before
+        assert "/w" in _manifest_paths(session_dir)
+
+    @pytest.mark.parametrize("bad", ["projects_list", "servers_null"])
+    def test_malformed_target_skipped(self, project_mcp_setup, bad):
+        default_config, session_dir, mgr = project_mcp_setup
+
+        def mutate(c):
+            if bad == "projects_list":
+                c["projects"] = ["bad"]
+            else:
+                c["projects"]["/w"]["mcpServers"] = None
+
+        _edit_json(session_dir / ".claude.json", mutate)
+        mgr._sync_sharing(session_dir, share=True)
+
+        config = _session_config(session_dir)
+        if bad == "projects_list":
+            assert config["projects"] == ["bad"]
+            assert not (session_dir / MCP_PROJECTS_MANIFEST).exists()
+        else:
+            # 只跳过坏掉的 path，其他 path 照常镜像。
+            assert config["projects"]["/w"]["mcpServers"] is None
+            assert config["projects"]["/repo"]["mcpServers"] == {"ga": GA_MCP}
+            assert _manifest_paths(session_dir) == ["/repo"]
+
+    def test_held_lock_fails_open(self, project_mcp_setup, monkeypatch):
+        from claude_swap import claude_locks
+
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+        default_config, session_dir, mgr = project_mcp_setup
+        (session_dir / ".claude.json.lock").mkdir()
+        before = (session_dir / ".claude.json").read_bytes()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / ".claude.json").read_bytes() == before
+        assert not (session_dir / MCP_PROJECTS_MANIFEST).exists()
+
+    def test_bootstrap_launch_mirrors(
+        self, temp_home, manager, auth_status_tracks_seed, refresh_rotates
+    ):
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"projects": {"/w": {"mcpServers": {"ads": ADS_MCP}}}})
+        )
+        session_dir, _, _ = manager.setup_session("2", share=True)
+
+        assert _session_projects(session_dir)["/w"]["mcpServers"] == {"ads": ADS_MCP}
+        assert _manifest_paths(session_dir) == ["/w"]
 
 
 # ---------------------------------------------------------------------------

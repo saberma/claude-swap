@@ -144,7 +144,8 @@ A session refreshes its own copy of the account's token, so once it exits, the c
 
 - With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
 - User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
-- `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
+- Local-scope MCP 服务器（`claude mcp add` 默认 scope，存在 `~/.claude.json` 的 `projects["<路径>"].mcpServers`）按项目路径同样镜像：默认 profile 里某路径有 local MCP，session 同路径的 `mcpServers` 就被整体替换成它（session 缺这个路径时按 Claude Code 默认形状新建条目）；默认侧删掉后，之前镜像过的路径会被清空。默认 profile 没有 local MCP 的路径不碰，session 里自己加的照常保留。该路径的其他设置（信任状态、`disabledMcpServers` 等开关）各账号各自保留，不镜像。
+- `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone; local-scope 只清之前镜像过的路径).
 
 </details>
 

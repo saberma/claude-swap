@@ -36,6 +36,7 @@ session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
 # to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
+# local scope 的 projects[<path>].mcpServers 同样单独镜像（按 path 拼接，
+# 条目里其他字段不动），见 _sync_project_mcp_servers。
 SHARED_ITEMS = (
     "settings.json",
     "keybindings.json",
@@ -110,6 +113,33 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 # One-time migration stash: session-local MCP definitions displaced by the
 # first mirror land here (write-once) instead of vanishing.
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
+
+# local scope（`claude mcp add` 默认）MCP 存在 .claude.json 的
+# projects[<绝对路径>].mcpServers 里，由 _sync_project_mcp_servers 按 path 镜像。
+PROJECTS_KEY = "projects"
+
+# 记录哪些 path 的 mcpServers 由 cswap 镜像。兼作逐 path 的接管标记：只有
+# 列在这里的 path，才会在默认侧删除或 --no-share 时被清空，session 自己在
+# 其他 path 加的 local MCP 永远不碰。
+MCP_PROJECTS_MANIFEST = ".cswap-mcp-projects.json"
+
+# 某 path 首次被接管时，session 原有且与默认侧不同的定义存到这里。按 path
+# 只写一次：已存过的 path 不再覆盖，保住最早那份。
+MCP_PROJECTS_DISPLACED_STASH = ".cswap-mcp-projects-displaced.json"
+
+# Claude Code 新建 project 条目时的默认字段（2.1.x 的 DEFAULT_PROJECT_CONFIG）。
+# 它读条目时是 `projects[p] ?? 默认值`、不逐字段合并，所以 session 里缺该
+# path 时要建完整形状的条目，不能只写一个 mcpServers。
+PROJECT_ENTRY_DEFAULTS: dict = {
+    "allowedTools": [],
+    "mcpContextUris": [],
+    "mcpServers": {},
+    "enabledMcpjsonServers": [],
+    "disabledMcpjsonServers": [],
+    "hasTrustDialogAccepted": False,
+    "hasClaudeMdExternalIncludesApproved": False,
+    "hasClaudeMdExternalIncludesWarningShown": False,
+}
 
 
 def stale_marker_for(session_dir: Path) -> Path:
@@ -1075,7 +1105,9 @@ class SessionManager:
 
         ``share`` governs SHARED_ITEMS (customizations) and the mcpServers
         mirror (see ``_sync_mcp_servers`` — its --no-share removal is gated
-        on the adoption marker); ``share_history`` governs HISTORY_ITEMS
+        on the adoption marker; local scope 的 projects[…].mcpServers 见
+        ``_sync_project_mcp_servers``，--no-share 只清 manifest 登记的
+        path); ``share_history`` governs HISTORY_ITEMS
         (conversation history) — independent concerns, so ``--no-share
         --share-history`` gives a bare profile with unified history.
         Idempotent; runs on every launch. Deliberately sources from the
@@ -1089,6 +1121,7 @@ class SessionManager:
         if not session_dir.is_dir():
             return
         self._sync_mcp_servers(session_dir, share)
+        self._sync_project_mcp_servers(session_dir, share)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
@@ -1193,8 +1226,9 @@ class SessionManager:
         Pure mirror: the default profile is the single source of truth, so
         adds, edits, and deletions all propagate, and MCP changes made inside
         a session are overwritten the next time cswap prepares the profile.
-        Nothing ever flows back into the default config, and per-project
-        (``projects[…].mcpServers``) entries are untouched on both sides.
+        Nothing ever flows back into the default config. 本方法只管顶层
+        key；local scope（``projects[…].mcpServers``）由
+        ``_sync_project_mcp_servers`` 按 path 镜像，语义相同。
 
         ``share=False`` removes the mirrored key — but only from profiles
         that have adopted mirroring (MCP_MIRROR_MARKER), so ``--no-share``
@@ -1299,6 +1333,242 @@ class SessionManager:
             self._logger.warning(
                 f"Could not sync MCP servers ({e}) — skipping this launch."
             )
+
+    def _sync_project_mcp_servers(self, session_dir: Path, share: bool) -> None:
+        """镜像默认 profile 的 local scope MCP（``projects[<path>].mcpServers``）。
+
+        与 ``_sync_mcp_servers`` 同语义：默认 profile 是唯一真相源，覆盖
+        session 内的改动，不回流。粒度是 path：
+
+        - 默认侧某 path 有非空 mcpServers：session 同 path 整体替换成它；
+          session 缺该 path 条目时按 Claude Code 的默认形状新建。
+        - 登记在 MCP_PROJECTS_MANIFEST 的 path，默认侧删空或删掉条目后：
+          session 同 path 清成 ``{}``（条目本身与其他字段保留）。
+        - 从未镜像过的 path（session 独有，或默认侧该 path 没有 MCP）不碰。
+        - 只改 mcpServers。disabledMcpServers / enabledMcpjsonServers 等开关
+          按账号各自保留（其中含 claude.ai 连接器这类账号专属的名字），与顶层
+          镜像一致，不镜像。
+
+        ``share=False`` 只清 manifest 登记的 path 并清空登记；从未接管过的
+        profile 不碰。某 path 首次接管时，session 原有且不同的定义先存进
+        MCP_PROJECTS_DISPLACED_STASH，存不下就放弃本次同步。
+
+        Fail-open 同顶层：任一侧不可读 / 格式不对、目标是符号链接、锁被占，
+        都原样放过、不挡启动。无变化且登记已同步时不取锁、不写盘。
+        """
+        config_path = session_dir / ".claude.json"
+        manifest_path = session_dir / MCP_PROJECTS_MANIFEST
+
+        if not share and not manifest_path.exists():
+            return  # 从未接管：--no-share 不能动 session 自己的数据
+
+        def read_source() -> tuple[dict, frozenset] | None:
+            if not share:
+                return {}, frozenset()  # 清掉登记过的 path，share 时再镜像回来
+            return self._read_project_mcp_source()
+
+        def read_plan() -> tuple[dict, dict, frozenset, frozenset, dict] | None:
+            source = read_source()
+            if source is None:
+                return None
+            # 读前先查类型：读 FIFO 会卡住启动，符号链接绝不写穿。顶层那趟
+            # 已对这种情况告警过，这里静默跳过。
+            if config_path.is_symlink() or not config_path.is_file():
+                return None
+            existing = self._load_json_object(config_path)
+            if existing is None:
+                return None
+            prev = self._read_project_manifest(manifest_path)
+            plan = self._plan_project_mcp(source, prev, existing)
+            if plan is None:
+                return None
+            changes, displaced, managed = plan
+            return changes, displaced, managed, prev, existing
+
+        plan = read_plan()
+        if plan is None:
+            return
+        changes, _, managed, prev, _ = plan
+        if not changes and managed == prev:
+            return
+
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                # 锁内重读两侧：等锁期间别的写者可能已更新，不能拿锁前快照覆盖。
+                plan = read_plan()
+                if plan is None:
+                    return
+                changes, displaced, managed, prev, existing = plan
+                if displaced and not self._stash_displaced_project_mcp(
+                    session_dir, displaced
+                ):
+                    return  # 唯一副本存不下，就不覆盖
+                if changes:
+                    projects = existing.setdefault(PROJECTS_KEY, {})
+                    for path, servers in changes.items():
+                        entry = projects.get(path)
+                        if entry is None:
+                            entry = copy.deepcopy(PROJECT_ENTRY_DEFAULTS)
+                            projects[path] = entry
+                        entry[MCP_KEY] = servers
+                    try:
+                        atomic_write_json(config_path, existing)
+                    except OSError as e:
+                        self._logger.warning(
+                            f"Could not sync project MCP servers: {e}"
+                        )
+                        return
+                if managed != prev:
+                    # 放在写配置之后：登记没落盘时，下次按「未接管」重算，
+                    # 那时已同步，不会误存 stash。
+                    try:
+                        atomic_write_json(
+                            manifest_path,
+                            {"schemaVersion": 1, "paths": sorted(managed)},
+                        )
+                    except OSError as e:
+                        self._logger.warning(
+                            f"Could not write {manifest_path.name}: {e}"
+                        )
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            self._logger.warning(
+                f"Could not sync project MCP servers ({e}) — skipping this launch."
+            )
+
+    @staticmethod
+    def _plan_project_mcp(
+        source: tuple[dict, frozenset], prev: frozenset, config: dict
+    ) -> tuple[dict, dict, frozenset] | None:
+        """算出 (要写的 path→servers, 首次接管时被顶掉的定义, 新登记集合)。
+
+        session 的 projects 不是对象时返回 None（整趟跳过）。单个 path 的
+        条目或 mcpServers 格式不对只跳过该 path，登记维持原状。
+        """
+        desired, unknown = source
+        projects = config.get(PROJECTS_KEY, {})
+        if not isinstance(projects, dict):
+            return None
+
+        def current_servers(path: str) -> dict | None:
+            entry = projects.get(path)
+            if entry is None:
+                return {}
+            if not isinstance(entry, dict):
+                return None
+            servers = entry.get(MCP_KEY, {})
+            return servers if isinstance(servers, dict) else None
+
+        changes: dict = {}
+        displaced: dict = {}
+        managed: set = set()
+        for path, servers in desired.items():
+            current = current_servers(path)
+            if current is None:
+                if path in prev:
+                    managed.add(path)
+                continue
+            managed.add(path)
+            if current == servers:
+                continue
+            changes[path] = servers
+            if path not in prev:
+                lost = {
+                    name: value
+                    for name, value in current.items()
+                    if name not in servers or servers[name] != value
+                }
+                if lost:
+                    displaced[path] = lost
+        for path in prev.difference(desired):
+            current = current_servers(path)
+            if path in unknown or current is None:
+                managed.add(path)  # 看不清就先不动，登记保留到下次
+                continue
+            if current:
+                changes[path] = {}
+        return changes, displaced, frozenset(managed)
+
+    @staticmethod
+    def _read_project_mcp_source() -> tuple[dict, frozenset] | None:
+        """默认 profile 的 local scope MCP：(path→非空 servers, 格式不对的 path)。
+
+        配置不可读或 projects 不是对象时返回 None，调用方整趟不动。没有
+        projects 字段视为没有 local MCP（登记过的 path 会被清掉）。
+        """
+        config = SessionManager._load_json_object(get_default_global_config_path())
+        if config is None:
+            return None
+        projects = config.get(PROJECTS_KEY, {})
+        if not isinstance(projects, dict):
+            return None
+        desired: dict = {}
+        unknown: set = set()
+        for path, entry in projects.items():
+            servers = entry.get(MCP_KEY, {}) if isinstance(entry, dict) else None
+            if not isinstance(servers, dict):
+                unknown.add(path)
+            elif servers:
+                desired[path] = servers
+        return desired, frozenset(unknown)
+
+    @staticmethod
+    def _read_project_manifest(manifest_path: Path) -> frozenset:
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            return frozenset()
+        data = SessionManager._load_json_object(manifest_path)
+        paths = data.get("paths") if data else None
+        if not isinstance(paths, list):
+            return frozenset()
+        return frozenset(p for p in paths if isinstance(p, str))
+
+    def _stash_displaced_project_mcp(
+        self, session_dir: Path, displaced: dict
+    ) -> bool:
+        """存下首次接管时被顶掉的定义；返回 False 则放弃本次同步。
+
+        按 path 只写一次：已存过的 path 保留最早那份，不被后来的漂移覆盖。
+        名字被目录 / 符号链接 / 无关文件占着时不算已存，阻止覆盖。
+        """
+        stash = session_dir / MCP_PROJECTS_DISPLACED_STASH
+        saved: dict = {}
+        if stash.is_symlink() or stash.exists():
+            data = (
+                None
+                if stash.is_symlink() or not stash.is_file()
+                else self._load_json_object(stash)
+            )
+            saved = data.get(PROJECTS_KEY) if data else None
+            if not isinstance(saved, dict):
+                self._logger.warning(
+                    f"{stash.name} exists but is not a valid stash; leaving "
+                    "the profile's project MCP servers in place."
+                )
+                return False
+        new = {
+            path: {MCP_KEY: servers}
+            for path, servers in displaced.items()
+            if path not in saved
+        }
+        if not new:
+            return True
+        try:
+            atomic_write_json(
+                stash, {"schemaVersion": 1, PROJECTS_KEY: {**saved, **new}}
+            )
+        except OSError as e:
+            self._logger.warning(
+                f"Could not stash the profile's project MCP servers ({e}); "
+                "leaving them in place."
+            )
+            return False
+        print(
+            dimmed(
+                "Session project MCP servers now mirror your default profile; "
+                f"the profile's previous definitions were saved to {stash.name}."
+            )
+        )
+        return True
 
     @staticmethod
     def _read_mcp_source() -> dict | None:

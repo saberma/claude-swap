@@ -16,10 +16,11 @@ would couple us to Claude's internal storage format and naming, where a
 mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
-``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
-them into the session profile — symlinks on macOS/Linux (Claude's settings writer
-detects symlinks and writes through to the target, so in-session ``/config``
-changes land in ``~/.claude``), copies re-synced on every launch on Windows.
+``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, ``rules/``, and
+``plugins/`` follow them into the session profile — symlinks on macOS/Linux
+(Claude's settings writer detects symlinks and writes through to the target,
+so in-session ``/config`` changes land in ``~/.claude``), copies re-synced on
+every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
@@ -67,14 +68,17 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
-# Deliberately excludes anything account- or instance-scoped: plugins/,
-# sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
+# Deliberately excludes anything account- or instance-scoped: sessions/,
+# ide/, .claude.json, .credentials.json, statsig/ and other
 # telemetry. projects/ and history.jsonl are per-account by default and move
 # to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
 # local scope 的 projects[<path>].mcpServers 同样单独镜像（按 path 拼接，
 # 条目里其他字段不动），见 _sync_project_mcp_servers。
+# plugins/ 也共享：settings.json 的 enabledPlugins 已共享，plugins/ 却各账号
+# 一份时，在一个账号装的插件到别的账号只剩启用记录、没有安装，静默缺失。
+# plugins/ 里没有账号凭据，只有安装清单、市场和缓存。
 SHARED_ITEMS = (
     "settings.json",
     "keybindings.json",
@@ -83,6 +87,7 @@ SHARED_ITEMS = (
     "commands",
     "agents",
     "rules",
+    "plugins",
 )
 
 # Conversation-history items linked additionally under --share-history.
